@@ -1,6 +1,7 @@
 [package]
 name = "voice-trainer-rs"
 version = "0.1.0"
+authors = ["Rae Forbes-Richardson <rae@neilo.gd>"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,3 +11,4 @@ rustfft = "6.0.1"
 portaudio = "0.7.0"
 crossterm = "0.25.0"
 tui = "0.19.0"
+ringbuf = "0.3.1"
