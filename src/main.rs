@@ -10,12 +10,17 @@ use std::{
 };
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    text::Span,
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType},
-    Frame, Terminal,
+    text::{Span, Spans},
+    widgets::canvas::{Canvas, Line, Map, MapResolution, Rectangle},
+    widgets::{
+        Axis, BarChart, Block, Borders, Cell, Chart, Dataset, Gauge, LineGauge, List, ListItem,
+        Paragraph, Row, Sparkline, Table, Tabs, Wrap, GraphType,
+    },
+    Frame,
+    Terminal,
 };
 
 extern crate portaudio;
@@ -26,7 +31,12 @@ extern crate ringbuf;
 use std::sync::Arc;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
-const SAMPLE_RATE: f64 = 44_100.0;
+extern crate cubic_spline;
+use cubic_spline::{Points, Point, SplineOpts, TryFrom};
+
+
+
+const SAMPLE_RATE: f64 = 48_000.0;
 const FRAMES: usize = 2048;           
 const RINGBUF_SIZE: usize = FRAMES * 8;
 const CHANNELS: i32 = 1;
@@ -120,6 +130,7 @@ impl AudioBackend {
 
             // process fft.
             self.fft.process(&mut self.fft_buffer);
+
         }
 
     }
@@ -128,19 +139,30 @@ impl AudioBackend {
 
 struct App {
     audio_backend: AudioBackend,
-    data1: Vec<(f64, f64)>,
-    data2: Vec<(f64, f64)>,
+    data_raw: Vec<(f64, f64)>,
+    data_fft_0: Vec<(f64, f64)>,
+    data_fft_1: Vec<(f64, f64)>,
+    data_fft_2: Vec<(f64, f64)>,
     window: [f64; 2],
 }
 
 impl App {
     fn new(audio_backend: AudioBackend) -> App {
-        let data1 = Vec::<(f64, f64)>::new();
-        let data2 = Vec::<(f64, f64)>::new();
+        let data_raw = Vec::<(f64, f64)>::new();
+        let mut data_fft_0 = Vec::<(f64, f64)>::new();
+        let mut data_fft_1 = Vec::<(f64, f64)>::new();
+        let mut data_fft_2 = Vec::<(f64, f64)>::new();
+
+        data_fft_0.resize(FRAMES, (0.0, 0.0));
+        data_fft_1.resize(FRAMES, (0.0, 0.0));
+        data_fft_2.resize(FRAMES, (0.0, 0.0));
+
         let mut app = App {
             audio_backend: audio_backend,
-            data1: data1,
-            data2: data2,
+            data_raw: data_raw,
+            data_fft_0: data_fft_0,
+            data_fft_1: data_fft_1,
+            data_fft_2: data_fft_2,
             window: [0.0, FRAMES as f64],
         };
 
@@ -152,26 +174,59 @@ impl App {
     fn on_tick(&mut self) {
         self.audio_backend.on_tick();
 
-        let mut off = 0.0;
-        self.data1.clear();
+        let mut idx: usize = 0;
+        self.data_raw.clear();
         for frame in self.audio_backend.buffer {
-            let mut data = (off, frame as f64);
+            let mut data = (idx as f64, frame as f64);
             
-            self.data1.push(data);
+            self.data_raw.push(data);
 
-            off += 1.0;
+            idx += 1;
         }
 
-        off= 0.0;
-        self.data2.clear();
+        idx = 0;
         for frame in self.audio_backend.fft_buffer.as_mut_slice() {
             let mag = 10.0 * f32::log10((frame.re * frame.re) + (frame.im * frame.im) + 1e-20);
-            let data = (off, mag as f64);           
-            self.data2.push(data);
+            let data = (idx as f64, mag as f64);           
+            self.data_fft_0[idx] = data;
+            idx += 1;
+        }
 
-            off += 1.0;
+        // cubic spline
+        let opts = SplineOpts::new()
+        .tension(0.5);
+
+        let mut points = Points::from(&self.data_fft_0[0..(FRAMES/8)]);
+        let result = points.calc_spline(&opts).expect("cant construct spline points");
+
+        for i in 0..FRAMES {
+            self.data_fft_0[i].0 = result.get_ref()[i].x;
+            self.data_fft_0[i].1 = result.get_ref()[i].y;
+        }
+
+        // Smooth history for vis.
+        for i in 0..FRAMES {
+            let data = self.data_fft_0[i];
+            self.data_fft_1[i] = (data.0, data.1.max(data.1 * 0.10 + self.data_fft_1[i].1 * 0.90));
+            self.data_fft_2[i] = (data.0, data.1.max(data.1 * 0.05 + self.data_fft_2[i].1 * 0.95));
         }
     }
+
+
+    fn find_strongest_peak(&self, max_x: f64) -> (f64, f64) {
+        let mut peak = (0.0, 0.0);
+        for i in 0..FRAMES {
+            let data = self.data_fft_0[i];
+            if data.0 > max_x {
+                break;
+            }
+            if data.1 > peak.1 {
+                peak = data;
+            }
+        }
+        return peak;
+    }
+
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -239,80 +294,58 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Ratio(1, 2),
-                Constraint::Ratio(1, 2),
+                Constraint::Ratio(9, 10),
+                Constraint::Ratio(1, 10),
             ]
             .as_ref(),
         )
         .split(size);
+
+    let fft_bounds = [0.0, (FRAMES / 64) as f64];
+    let fft_window = [0.0, (fft_bounds[1] / FRAMES as f64) * SAMPLE_RATE ];
+
     let x_labels = vec![
         Span::styled(
-            format!("{}", app.window[0]),
+            format!("{}Hz", fft_window[0]),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("{}", (app.window[0] + app.window[1]) / 2.0)),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.9 + fft_window[1] * 0.1))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.8 + fft_window[1] * 0.2))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.7 + fft_window[1] * 0.3))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.6 + fft_window[1] * 0.4))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.5 + fft_window[1] * 0.5))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.4 + fft_window[1] * 0.6))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.3 + fft_window[1] * 0.7))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.2 + fft_window[1] * 0.8))),
+        Span::raw(format!("{}Hz", (fft_window[0] * 0.1 + fft_window[1] * 0.9))),
         Span::styled(
-            format!("{}", app.window[1]),
+            format!("{}Hz", fft_window[1]),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
+
     let datasets = vec![
         Dataset::default()
-            .name("Raw Data")
-            .marker(symbols::Marker::Dot)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&app.data1),
+            .name("FFT 2")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::DarkGray))
+            .graph_type(GraphType::Line)
+            .data(&app.data_fft_2),
+        Dataset::default()
+            .name("FFT 1")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Gray))
+            .graph_type(GraphType::Line)
+            .data(&app.data_fft_1),
+        Dataset::default()        
+            .name("FFT 0")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::White))
+            .graph_type(GraphType::Line)
+            .data(&app.data_fft_0),
     ];
 
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    "Waveform",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL),
-        )
-        .x_axis(
-            Axis::default()
-                .title("X Axis")
-                .style(Style::default().fg(Color::Gray))
-                .labels(x_labels)
-                .bounds(app.window),
-        )
-        .y_axis(
-            Axis::default()
-                .title("Y Axis")
-                .style(Style::default().fg(Color::Gray))
-                .labels(vec![
-                    Span::styled("-1", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw("0"),
-                    Span::styled("1", Style::default().add_modifier(Modifier::BOLD)),
-                ])
-                .bounds([-1.0, 1.0]),
-        );
-    f.render_widget(chart, chunks[0]);
-
-    let x_labels = vec![
-        Span::styled(
-            format!("{}", app.window[0]),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!("{}", (app.window[0] + app.window[1] / 8.0) / 2.0)),
-        Span::styled(
-            format!("{}", app.window[1] / 8.0),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let datasets = vec![Dataset::default()
-        .name("data")
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(Color::Yellow))
-        .graph_type(GraphType::Line)
-        .data(&app.data2)];
-        let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .title(Span::styled(
@@ -328,7 +361,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
                 .title("X Axis")
                 .style(Style::default().fg(Color::Gray))
                 .labels(x_labels)
-                .bounds([0.0, (FRAMES / 8) as f64]),
+                .bounds(fft_bounds),
         )
         .y_axis(
             Axis::default()
@@ -341,5 +374,25 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
                 ])
                 .bounds([0.0, 50.0]),
         );
-   f.render_widget(chart, chunks[1]);
+   f.render_widget(chart, chunks[0]);
+
+   let block = Block::default()
+        .title(Span::styled(
+            "Analysis",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let strongest_peak = app.find_strongest_peak(FRAMES as f64 / 64.0);
+    let strongest_pitch = (strongest_peak.0 / FRAMES as f64) * SAMPLE_RATE;
+    let fft_window = [0.0, (fft_bounds[1] / FRAMES as f64) * SAMPLE_RATE ];
+    
+    let text = vec![
+            Spans::from(format!("Pitch: {}Hz", strongest_pitch)),
+            Spans::from(""),
+        ];
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, chunks[1]);
 }
