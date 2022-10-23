@@ -143,7 +143,9 @@ struct App {
     data_fft_0: Vec<(f64, f64)>,
     data_fft_1: Vec<(f64, f64)>,
     data_fft_2: Vec<(f64, f64)>,
-    window: [f64; 2],
+    data_pitch: Vec<(f64, f64)>,
+    window_pitch: [f64; 2],
+    time_pitch: f64,
 }
 
 impl App {
@@ -152,7 +154,7 @@ impl App {
         let mut data_fft_0 = Vec::<(f64, f64)>::new();
         let mut data_fft_1 = Vec::<(f64, f64)>::new();
         let mut data_fft_2 = Vec::<(f64, f64)>::new();
-
+        let mut data_pitch = Vec::<(f64, f64)>::new();
         data_fft_0.resize(FRAMES, (0.0, 0.0));
         data_fft_1.resize(FRAMES, (0.0, 0.0));
         data_fft_2.resize(FRAMES, (0.0, 0.0));
@@ -163,7 +165,9 @@ impl App {
             data_fft_0: data_fft_0,
             data_fft_1: data_fft_1,
             data_fft_2: data_fft_2,
-            window: [0.0, FRAMES as f64],
+            data_pitch: data_pitch,
+            window_pitch: [0.0, 300.0],
+            time_pitch: 0.0,
         };
 
         app.audio_backend.start();
@@ -210,9 +214,26 @@ impl App {
             self.data_fft_1[i] = (data.0, data.1.max(data.1 * 0.10 + self.data_fft_1[i].1 * 0.90));
             self.data_fft_2[i] = (data.0, data.1.max(data.1 * 0.05 + self.data_fft_2[i].1 * 0.95));
         }
-    }
 
+        // Grab strongest pitch and put into the history buffer.
+        let strongest_peak = self.find_strongest_peak(FRAMES as f64 / 64.0);
+        let strongest_pitch = (strongest_peak.0 / FRAMES as f64) * SAMPLE_RATE;
 
+        if strongest_peak.1 > 25.0 {
+            self.data_pitch.push((self.time_pitch, strongest_pitch));
+        }
+
+        self.time_pitch += 1.0;
+        if self.time_pitch >= self.window_pitch[1] {
+            if self.data_pitch.len() > 0 && self.data_pitch[0].0 < self.window_pitch[0] {
+                self.data_pitch.remove(0);
+            }
+            self.window_pitch[0] += 1.0;
+            self.window_pitch[1] += 1.0;
+
+        }
+}
+    
     fn find_strongest_peak(&self, max_x: f64) -> (f64, f64) {
         let mut peak = (0.0, 0.0);
         for i in 0..FRAMES {
@@ -291,17 +312,17 @@ fn run_app<B: Backend>(
 fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
     let size = f.size();
     let chunks = Layout::default()
-        .direction(Direction::Vertical)
+        .direction(Direction::Horizontal)
         .constraints(
             [
-                Constraint::Ratio(9, 10),
-                Constraint::Ratio(1, 10),
+                Constraint::Ratio(5, 10),
+                Constraint::Ratio(5, 10),
             ]
             .as_ref(),
         )
         .split(size);
 
-    let fft_bounds = [0.0, (FRAMES / 64) as f64];
+    let fft_bounds = [0.0, (FRAMES / 32) as f64];
     let fft_window = [0.0, (fft_bounds[1] / FRAMES as f64) * SAMPLE_RATE ];
 
     let x_labels = vec![
@@ -385,6 +406,49 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
 
+    let datasets = vec![
+        Dataset::default()
+            .name("Pitch")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::DarkGray))
+            .graph_type(GraphType::Line)
+            .data(&app.data_pitch)
+    ];
+    
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    "Pitch",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .style(Style::default().fg(Color::Gray))
+                .bounds(app.window_pitch),
+        )
+        .y_axis(
+            Axis::default()
+                .title("Pitch")
+                .style(Style::default().fg(Color::Gray))
+                .labels(vec![
+                    Span::raw("50Hz"),
+                    Span::raw("100Hz"),
+                    Span::raw("150Hz"),
+                    Span::raw("200Hz"),
+                    Span::raw("250Hz"),
+                    Span::raw("300Hz"),
+                ])
+                .bounds([50.0, 300.0]),
+        );
+   f.render_widget(chart, chunks[1]);
+
+    /*
     let strongest_peak = app.find_strongest_peak(FRAMES as f64 / 64.0);
     let strongest_pitch = (strongest_peak.0 / FRAMES as f64) * SAMPLE_RATE;
     let fft_window = [0.0, (fft_bounds[1] / FRAMES as f64) * SAMPLE_RATE ];
@@ -395,4 +459,5 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
         ];
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, chunks[1]);
+    */
 }
